@@ -1,8 +1,10 @@
 import axios from 'axios';
 
 const API_KEY_COINCAP = "9633c3f27380e288ca4f247026fa95916100bc7a02aa21e6fa3ccd696aab73a9";
-const AI_API_KEY = "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";
+const AI_API_KEY = "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";
 const AI_MODEL = "deepseek/deepseek-r1:free";
+
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export interface CoinData {
   timestamp: string;
@@ -22,7 +24,10 @@ export interface CoinData {
 export async function getCoinId(symbol: string): Promise<string> {
   try {
     const headers = { "Authorization": `Bearer ${API_KEY_COINCAP}` };
-    const response = await axios.get("https://rest.coincap.io/v3/assets", { headers });
+    const response = await axios.get("https://rest.coincap.io/v3/assets", { 
+      headers,
+      timeout: 10000 // Tambahkan timeout
+    });
     
     const coin = response.data.data.find((coin: any) => 
       coin.symbol.toLowerCase() === symbol.toLowerCase()
@@ -52,7 +57,11 @@ export async function getMarketData(coinId: string, interval: string = 'h1'): Pr
       end: endTime.getTime(),
     };
 
-    const response = await axios.get(url, { params, headers });
+    const response = await axios.get(url, { 
+      params, 
+      headers,
+      timeout: 15000 // Tambahkan timeout
+    });
     const data = response.data.data;
 
     const processedData: CoinData[] = data.map((item: any, index: number) => {
@@ -218,6 +227,97 @@ function formatAIResponse(rawResponse: string): string {
   return formattedSections.join('\n\n');
 }
 
+// Enhanced function to make API calls to OpenRouter with proper error handling
+async function callOpenRouterAPI(messages: any[], retryCount = 0): Promise<string> {
+  const maxRetries = 3;
+  
+  try {
+    // Perbaikan untuk headers sesuai kebijakan OpenRouter
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${AI_API_KEY}`,
+      "HTTP-Referer": process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000",
+      "X-Title": "Crypto Analysis Tool",
+      // Tambahkan User-Agent yang lebih spesifik
+      "User-Agent": "CryptoAnalyzer/1.0"
+    };
+
+    const requestBody = {
+      model: AI_MODEL,
+      messages: messages,
+      temperature: 0.7,
+      max_tokens: 2000, // Batasi token untuk menghindari masalah
+      top_p: 1,
+      frequency_penalty: 0,
+      presence_penalty: 0
+    };
+
+    console.log('Making API call to OpenRouter...');
+    
+    const response = await axios.post(
+      OPENROUTER_BASE_URL,
+      requestBody,
+      {
+        headers,
+        timeout: 60000, // Increase timeout untuk production
+        validateStatus: function (status) {
+          return status < 500; // Resolve only if status is less than 500
+        }
+      }
+    );
+
+    // Handle different response status codes
+    if (response.status === 401) {
+      throw new Error("API key tidak valid atau sudah expired");
+    }
+    
+    if (response.status === 402) {
+      throw new Error("Kredit API habis, silakan top up atau coba lagi nanti");
+    }
+    
+    if (response.status === 429) {
+      if (retryCount < maxRetries) {
+        console.log(`Rate limit hit, retrying in ${2 ** retryCount} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, (2 ** retryCount) * 1000));
+        return callOpenRouterAPI(messages, retryCount + 1);
+      }
+      throw new Error("Rate limit exceeded, silakan coba lagi nanti");
+    }
+
+    if (response.status >= 400) {
+      throw new Error(`API error: ${response.status} - ${response.statusText}`);
+    }
+
+    if (response.data.choices && response.data.choices[0]) {
+      const rawResponse = response.data.choices[0].message.content;
+      return formatAIResponse(rawResponse);
+    } else {
+      throw new Error("Format response tidak valid dari AI");
+    }
+  } catch (error: any) {
+    console.error("OpenRouter API Error:", error.response?.data || error.message);
+    
+    if (retryCount < maxRetries && !error.response?.status) {
+      console.log(`Network error, retrying ${retryCount + 1}/${maxRetries}...`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+      return callOpenRouterAPI(messages, retryCount + 1);
+    }
+    
+    // Return user-friendly error messages
+    if (error.response?.status === 401) {
+      return "Analisis gagal: API key tidak valid. Silakan periksa konfigurasi.";
+    } else if (error.response?.status === 402) {
+      return "Analisis gagal: Kredit API habis. Silakan coba lagi nanti.";
+    } else if (error.response?.status === 429) {
+      return "Analisis gagal: Rate limit exceeded. Silakan coba lagi dalam beberapa menit.";
+    } else if (error.code === 'ECONNABORTED') {
+      return "Analisis gagal: Timeout. Silakan coba lagi.";
+    } else {
+      return `Analisis gagal: ${error.message}. Silakan coba lagi nanti.`;
+    }
+  }
+}
+
 // Declare file system interface for browser environment
 declare global {
   interface Window {
@@ -357,35 +457,16 @@ Please provide comprehensive analysis based on the uploaded data.
 `;
     }
 
-    // Call AI analysis
-    const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: AI_MODEL,
-        messages: [
-          { 
-            role: "system", 
-            content: "You are a professional cryptocurrency analyst. Analyze uploaded crypto data and provide insights in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
-          },
-          { role: "user", content: analysisPrompt }
-        ],
-        temperature: 0.7
+    // Call AI analysis with improved error handling
+    const messages = [
+      { 
+        role: "system", 
+        content: "You are a professional cryptocurrency analyst. Analyze uploaded crypto data and provide insights in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
       },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${AI_API_KEY}`
-        },
-        timeout: 30000
-      }
-    );
+      { role: "user", content: analysisPrompt }
+    ];
 
-    if (response.data.choices && response.data.choices[0]) {
-      const rawResponse = response.data.choices[0].message.content;
-      return formatAIResponse(rawResponse);
-    } else {
-      throw new Error("Invalid response from AI");
-    }
+    return await callOpenRouterAPI(messages);
   } catch (error) {
     console.error("File analysis error:", error);
     return `Failed to analyze file ${filename}. Please ensure the file contains valid cryptocurrency data and try again.`;
@@ -444,34 +525,15 @@ Strategic Forecast: Offer enhanced predictions for the next 24-48 hours based on
 Please write your response in clear, professional paragraphs without using any symbols, emojis, bullet points, or numbered lists.
 `;
 
-    const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: AI_MODEL,
-        messages: [
-          { 
-            role: "system", 
-            content: "You are a professional cryptocurrency analyst. Provide comprehensive analysis combining live market data with uploaded file information in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
-          },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.7
+    const messages = [
+      { 
+        role: "system", 
+        content: "You are a professional cryptocurrency analyst. Provide comprehensive analysis combining live market data with uploaded file information in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
       },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${AI_API_KEY}`
-        },
-        timeout: 30000
-      }
-    );
+      { role: "user", content: prompt }
+    ];
 
-    if (response.data.choices && response.data.choices[0]) {
-      const rawResponse = response.data.choices[0].message.content;
-      return formatAIResponse(rawResponse);
-    } else {
-      throw new Error("Invalid response from AI");
-    }
+    return await callOpenRouterAPI(messages);
   } catch (error) {
     console.error("Enhanced analysis error:", error);
     return "Enhanced analysis failed. Please try again later.";
@@ -514,37 +576,13 @@ Short-term Forecast: Provide insights on the likely price movement over the next
 Please write your response in clear, professional paragraphs without using any symbols, emojis, bullet points, or numbered lists. Focus on providing actionable insights in a narrative format.
 `;
 
-  try {
-    const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: AI_MODEL,
-        messages: [
-          { 
-            role: "system", 
-            content: "You are a professional cryptocurrency analyst. Provide analysis in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
-          },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.7
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${AI_API_KEY}`
-        },
-        timeout: 30000
-      }
-    );
+  const messages = [
+    { 
+      role: "system", 
+      content: "You are a professional cryptocurrency analyst. Provide analysis in clean paragraph format without using any symbols, emojis, bullet points, or numbered lists. Write in a professional, narrative style." 
+    },
+    { role: "user", content: prompt }
+  ];
 
-    if (response.data.choices && response.data.choices[0]) {
-      const rawResponse = response.data.choices[0].message.content;
-      return formatAIResponse(rawResponse);
-    } else {
-      throw new Error("Invalid response from AI");
-    }
-  } catch (error) {
-    console.error("AI analysis error:", error);
-    return "AI analysis failed. Please try again later.";
-  }
+  return await callOpenRouterAPI(messages);
 }
