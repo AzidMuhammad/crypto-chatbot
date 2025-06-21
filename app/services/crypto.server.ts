@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const API_KEY_COINCAP = "9633c3f27380e288ca4f247026fa95916100bc7a02aa21e6fa3ccd696aab73a9";
-const AI_API_KEY = "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";
+const AI_API_KEY = "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";
 const AI_MODEL = "deepseek/deepseek-r1:free";
 
 export interface CoinData {
