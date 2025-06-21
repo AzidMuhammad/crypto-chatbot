@@ -1,9 +1,11 @@
 import axios from 'axios';
 
-const API_KEY_COINCAP = "9633c3f27380e288ca4f247026fa95916100bc7a02aa21e6fa3ccd696aab73a9";
-const AI_API_KEY = "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";
-const AI_MODEL = "deepseek/deepseek-r1:free";
+// Gunakan environment variables atau fallback ke hardcoded values
+const API_KEY_COINCAP = process.env.COINCAP_API_KEY || "9633c3f27380e288ca4f247026fa95916100bc7a02aa21e6fa3ccd696aab73a9";
+const AI_API_KEY = process.env.OPENROUTER_API_KEY || process.env.AI_API_KEY || "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";
+const AI_MODEL = process.env.AI_MODEL || "deepseek/deepseek-r1:free";
 
+// Tambahkan base URL untuk OpenRouter
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export interface CoinData {
@@ -232,86 +234,145 @@ async function callOpenRouterAPI(messages: any[], retryCount = 0): Promise<strin
   const maxRetries = 3;
   
   try {
+    // Debug log untuk memastikan API key tersedia
+    console.log('API Key available:', AI_API_KEY ? 'Yes' : 'No');
+    console.log('API Key prefix:', AI_API_KEY ? AI_API_KEY.substring(0, 10) + '...' : 'None');
+    
+    if (!AI_API_KEY || AI_API_KEY === 'undefined') {
+      throw new Error('OpenRouter API key tidak ditemukan dalam environment variables');
+    }
+    
     // Perbaikan untuk headers sesuai kebijakan OpenRouter
-    const headers = {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${AI_API_KEY}`,
-      "HTTP-Referer": process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3000",
-      "X-Title": "Crypto Analysis Tool",
-      // Tambahkan User-Agent yang lebih spesifik
-      "User-Agent": "CryptoAnalyzer/1.0"
     };
+
+    // Tambahkan HTTP-Referer hanya jika tersedia
+    if (typeof window !== 'undefined') {
+      headers["HTTP-Referer"] = window.location.origin;
+    } else if (process.env.VERCEL_URL) {
+      headers["HTTP-Referer"] = `https://${process.env.VERCEL_URL}`;
+    } else if (process.env.NEXT_PUBLIC_VERCEL_URL) {
+      headers["HTTP-Referer"] = `https://${process.env.NEXT_PUBLIC_VERCEL_URL}`;
+    }
+
+    // Tambahkan X-Title untuk identifikasi
+    headers["X-Title"] = "Crypto Analysis Tool";
 
     const requestBody = {
       model: AI_MODEL,
       messages: messages,
       temperature: 0.7,
-      max_tokens: 2000, // Batasi token untuk menghindari masalah
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0
+      max_tokens: 1500, // Kurangi untuk menghindari masalah
+      top_p: 0.9,
+      frequency_penalty: 0.1,
+      presence_penalty: 0.1,
+      // Tambahkan stream: false untuk memastikan response non-streaming
+      stream: false
     };
 
-    console.log('Making API call to OpenRouter...');
+    console.log('Making API call to OpenRouter with model:', AI_MODEL);
+    console.log('Request headers:', Object.keys(headers));
     
     const response = await axios.post(
       OPENROUTER_BASE_URL,
       requestBody,
       {
         headers,
-        timeout: 60000, // Increase timeout untuk production
+        timeout: 45000, // Kurangi timeout
         validateStatus: function (status) {
           return status < 500; // Resolve only if status is less than 500
-        }
+        },
+        // Tambahkan transformRequest untuk debugging
+        transformRequest: [(data) => {
+          console.log('Request payload size:', JSON.stringify(data).length);
+          return JSON.stringify(data);
+        }]
       }
     );
 
+    console.log('Response status:', response.status);
+    console.log('Response headers:', response.headers);
+
     // Handle different response status codes
     if (response.status === 401) {
+      console.error('Authentication failed. API key may be invalid or expired.');
       throw new Error("API key tidak valid atau sudah expired");
     }
     
     if (response.status === 402) {
+      console.error('Payment required. Credits may be exhausted.');
       throw new Error("Kredit API habis, silakan top up atau coba lagi nanti");
     }
     
     if (response.status === 429) {
+      console.log('Rate limit hit, status 429');
       if (retryCount < maxRetries) {
-        console.log(`Rate limit hit, retrying in ${2 ** retryCount} seconds...`);
-        await new Promise(resolve => setTimeout(resolve, (2 ** retryCount) * 1000));
+        const delay = Math.min(1000 * Math.pow(2, retryCount), 10000);
+        console.log(`Rate limit hit, retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
         return callOpenRouterAPI(messages, retryCount + 1);
       }
       throw new Error("Rate limit exceeded, silakan coba lagi nanti");
     }
 
     if (response.status >= 400) {
+      console.error('API error:', response.status, response.statusText, response.data);
       throw new Error(`API error: ${response.status} - ${response.statusText}`);
     }
 
-    if (response.data.choices && response.data.choices[0]) {
-      const rawResponse = response.data.choices[0].message.content;
+    console.log('Response data structure:', Object.keys(response.data || {}));
+    
+    if (response.data && response.data.choices && response.data.choices[0]) {
+      const rawResponse = response.data.choices[0].message?.content;
+      if (!rawResponse) {
+        throw new Error("Response content kosong dari AI");
+      }
       return formatAIResponse(rawResponse);
     } else {
+      console.error('Invalid response structure:', response.data);
       throw new Error("Format response tidak valid dari AI");
     }
   } catch (error: any) {
-    console.error("OpenRouter API Error:", error.response?.data || error.message);
+    console.error("OpenRouter API Error Details:", {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message,
+      config: {
+        url: error.config?.url,
+        method: error.config?.method,
+        headers: error.config?.headers ? Object.keys(error.config.headers) : undefined
+      }
+    });
     
-    if (retryCount < maxRetries && !error.response?.status) {
-      console.log(`Network error, retrying ${retryCount + 1}/${maxRetries}...`);
-      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+    // Specific error handling untuk debugging
+    if (error.response?.status === 401) {
+      console.error('401 Error - Possible causes:');
+      console.error('1. Invalid API key');
+      console.error('2. API key not properly formatted');
+      console.error('3. API key expired or revoked');
+      console.error('Current API key prefix:', AI_API_KEY ? AI_API_KEY.substring(0, 15) + '...' : 'Not found');
+      return "Analisis gagal: API key tidak valid. Periksa konfigurasi API key OpenRouter.";
+    }
+    
+    if (retryCount < maxRetries && (!error.response || error.response.status >= 500)) {
+      const delay = Math.min(1000 * Math.pow(2, retryCount), 5000);
+      console.log(`Network/server error, retrying ${retryCount + 1}/${maxRetries} in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
       return callOpenRouterAPI(messages, retryCount + 1);
     }
     
     // Return user-friendly error messages
-    if (error.response?.status === 401) {
-      return "Analisis gagal: API key tidak valid. Silakan periksa konfigurasi.";
-    } else if (error.response?.status === 402) {
+    if (error.response?.status === 402) {
       return "Analisis gagal: Kredit API habis. Silakan coba lagi nanti.";
     } else if (error.response?.status === 429) {
       return "Analisis gagal: Rate limit exceeded. Silakan coba lagi dalam beberapa menit.";
     } else if (error.code === 'ECONNABORTED') {
       return "Analisis gagal: Timeout. Silakan coba lagi.";
+    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      return "Analisis gagal: Koneksi ke server gagal. Periksa koneksi internet.";
     } else {
       return `Analisis gagal: ${error.message}. Silakan coba lagi nanti.`;
     }
